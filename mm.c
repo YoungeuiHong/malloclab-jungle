@@ -105,7 +105,11 @@ static void *extend_heap(size_t words);
 static void *coalesce(void *bp);
 
 /* 가용한 블록 검색하기 (first-fit) */
-static void *find_fit(size_t asize);
+static void *first_fit(size_t asize);
+
+/* 가용한 블록 검색하기 (next-fit) */
+static void *next_fit(size_t asize);
+static void *last_alloc = NULL;
 
 /* 할당된 블록 배치하기 */
 static void place(void *bp, size_t asize);
@@ -162,7 +166,7 @@ void *mm_malloc(size_t size)
         asize = DSIZE * ((size + (DSIZE) + (DSIZE - 1)) / DSIZE); // size에 가장 가까운 double word size의 배수 찾기
 
     // 가용한 블록 찾기
-    if ((bp = find_fit(asize)) != NULL)
+    if ((bp = next_fit(asize)) != NULL)
     {
         place(bp, asize);
         return bp;
@@ -252,7 +256,7 @@ static void *coalesce(void *bp)
     size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp))); // 다음 블록의 할당 여부
     size_t size = GET_SIZE(HDRP(bp));                   // 해제된 현재 블록의 사이즈
 
-    // Case 1. 이전 블록, 다음 블록 모두 할당된 상태 
+    // Case 1. 이전 블록, 다음 블록 모두 할당된 상태
     if (prev_alloc && next_alloc)
     {
         return bp; // => 아무 작업 없이 현재 블록 포인터 리턴
@@ -284,11 +288,13 @@ static void *coalesce(void *bp)
         bp = PREV_BLKP(bp);
     }
 
+    last_alloc = bp;
+
     return bp;
 }
 
-/* 가용한 블록 검색하기 */
-static void *find_fit(size_t asize)
+/* 가용한 블록 검색하기 (first-fit) */
+static void *first_fit(size_t asize)
 {
     void *bp;
 
@@ -302,6 +308,32 @@ static void *find_fit(size_t asize)
     }
 
     return NULL;
+}
+
+/* 가용한 블록 검색하기 (next-fit) */
+static void *next_fit(size_t asize)
+{
+    void *bp;
+
+    // 마지막에 할당된 위치가 없으면 처음부터 탐색 시작
+    if (last_alloc == NULL)
+        last_alloc = heap_listp;
+
+    // 마지막에 탐색이 끝난 지점에서부터 에필로그 블록이 이르기 전까지 (=> GET_SIZE(HDRP(bp)) > 0) 블록 탐색
+    for (bp = last_alloc; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp))
+    {
+        if (!GET_ALLOC(HDRP(bp)) && (asize <= GET_SIZE(HDRP(bp))))
+            return bp;
+    }
+
+    // 가용한 블럭을 발견하지 못했다면 처음 ~ 마지막에 탐색이 시작된 지점까지 다시 탐색
+    for (bp = heap_listp; bp < last_alloc; bp = NEXT_BLKP(bp))
+    {
+        if (!GET_ALLOC(HDRP(bp)) && (asize <= GET_SIZE(HDRP(bp))))
+            return bp;
+    }
+
+   return NULL;
 }
 
 /* 할당된 블록 배치하기 */
@@ -324,4 +356,7 @@ static void place(void *bp, size_t asize)
         PUT(HDRP(bp), PACK(fsize, 1));
         PUT(FTRP(bp), PACK(fsize, 1));
     }
+
+    // next-fit 검색을 위해 마지막으로 할당된 블록의 다음 위치 기록
+    last_alloc = bp;
 }
