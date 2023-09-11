@@ -181,7 +181,7 @@ void *mm_malloc(size_t size)
 }
 
 /*
- * mm_free - Freeing a block does nothing.
+ * mm_free - 메모리 반환하기
  */
 void mm_free(void *ptr)
 {
@@ -195,8 +195,7 @@ void mm_free(void *ptr)
 }
 
 /*
- * mm_realloc - 메모리 할당 사이즈 변경
- * 새로운 사이즈가 기존 사이즈보다 더 큰 경우 추가적인 메모리를 할당하고, 기존 사이즈보다 작은 경우 초과하는 메모리를 해제함
+ * mm_realloc - 기존에 할당된 메모리 블록의 사이즈 변경
  * 새로 할당 받은 메모리 블록에는 기존 메모리 블록의 데이터가 복사되어 들어가야 함
  */
 void *mm_realloc(void *bp, size_t size)
@@ -333,7 +332,7 @@ static void *next_fit(size_t asize)
             return bp;
     }
 
-   return NULL;
+    return NULL;
 }
 
 /* 할당된 블록 배치하기 */
@@ -357,6 +356,6 @@ static void place(void *bp, size_t asize)
         PUT(FTRP(bp), PACK(fsize, 1));
     }
 
-    // next-fit 검색을 위해 마지막으로 할당된 블록의 다음 위치 기록
+    // next-fit 검색을 위해 마지막으로 할당된 블록의 위치 기록
     last_alloc = bp;
 }
