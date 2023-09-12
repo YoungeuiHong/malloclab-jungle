@@ -1,5 +1,5 @@
 /*
- * 🚀 Explicit Free List (명시적 가용 리스트 / LIFO 방식)
+ * 🚀 Segregated Free List (분리 가용 리스트)
  */
 
 #include <stdio.h>
@@ -9,7 +9,6 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <errno.h>
-
 #include "mm.h"
 #include "memlib.h"
 
@@ -25,356 +24,131 @@ team_t team = {
     /* Second member's email address (leave blank if none) */
     ""};
 
-/* single word (4) or double word (8) alignment */
+/***************************************** 상수 *******************************************/
+
+#define MAX_POWER 50 // 2의 최대 몇 제곱까지 사이즈 클래스를 지원할지. 여기에서는 2^50까지의 사이즈 클래스를 지원함
+#define TAKEN 1
+#define FREE 0
+#define WORD_SIZE 4
+#define D_WORD_SIZE 8
+#define CHUNK ((1 << 12) / WORD_SIZE)
+#define STATUS_BIT_SIZE 3 // 할당된 블록과 할당되지 않은 블록을 구분하기 위해 사용되는 비트의 크기
+#define HDR_FTR_SIZE 2    // 단위: word
+#define HDR_SIZE 1        // 단위: word
+#define FTR_SIZE 1        // 단위: word
+#define PRED_FIELD_SIZE 1 // 단위: word
+#define EPILOG_SIZE 2     // 단위: word
 #define ALIGNMENT 8
 
-/* rounds up to the nearest multiple of ALIGNMENT */
-#define ALIGN(size) (((size) + (ALIGNMENT - 1)) & ~0x7)
+/*************************************** 매크로 **********************************************/
 
-/* size_t 변수가 차지하는 메모리 공간 크기를 8바이트 경계에 맞출 수 있도록 조정 */
-#define SIZE_T_SIZE (ALIGN(sizeof(size_t)))
+/* 주소 p에 적힌 값을 읽어오기 */
+#define GET_WORD(p) (*(unsigned int *)(p))
 
-/* Word and header/footer size (bytes) */
-#define WSIZE 4
+/* 주소 p에 새로운 값을 쓰기*/
+#define PUT_WORD(p, val) (*(char **)(p) = (val))
 
-/* Double word size (bytes) */
-#define DSIZE 8
+/* size보다 크면서 가장 가까운 ALIGNMENT의 배수 찾기 */
+#define ALIGN(size) (((size) + (ALIGNMENT - 1)) & ~(ALIGNMENT - 1))
 
-/* Extend heap by this amount (bytes) */
-#define CHUNKSIZE (1 << 12)
-
-/* Get maximum value */
-#define MAX(x, y) ((x) > (y) ? (x) : (y))
+/* x보다 크면서 가장 가까운 짝수 찾기 */
+#define EVENIZE(x) ((x + 1) & ~1)
 
 /*
- * Pack a size and allocated bit into a word
- * 블록의 크기와 할당 비트를 통합해서 header와 footer에 저장할 수 있는 값을 리턴
- */
-#define PACK(size, alloc) ((size) | (alloc))
-
-/*
- * Read a word at address p
- * p에 있는 값을 (unsigned int *) 타입으로 변환하여 가져옴
- */
-#define GET(p) (*(unsigned int *)(p))
-
-/* Write a word at address p */
-#define PUT(p, val) (*(unsigned int *)(p) = (val))
-
-/*
- * Read the size field from address p
- * 16진수 0x7은 10진수로 7을 의미. 이를 이진수로 변환하면 0111이 되고 NOT 연산자 ~를 붙이면 1000이 됨
- * 주소값 p와 and 연산을 하면 비트의 마지막 세 자리를 0으로 바꿈
+ * 블록 사이즈 가져오기
+ * how? 16진수 0x7은 10진수로 7을 의미. 이를 이진수로 변환하면 0111이 되고 NOT 연산자 ~를 붙이면 1000이 됨. 주소값 p와 and 연산을 하면 비트의 마지막 세 자리를 0으로 바꿈
  */
 #define GET_SIZE(p) (GET(p) & ~0x7)
 
 /*
- * Read the allocated field from address p
- * 마지막 자리를 제외하고 모두 0으로 바꿈
- * 할당이 되어 있다면 마지막 자리가 1로 반환되고, 할당이 안 되어 있다면 마지막 자리가 0으로 반환됨
+ * 블록의 할당 여부 가져오기
+ * how? 마지막 자리를 제외하고 모두 0으로 바꿈. 할당이 되어 있다면 마지막 자리가 1로 반환되고, 할당이 안 되어 있다면 마지막 자리가 0으로 반환됨
  */
-#define GET_ALLOC(p) (GET(p) & 0x1)
+#define GET_STATUS(p) (GET(p) & 0x1)
 
 /*
- * 블록 포인터 bp가 주어지면 블록의 헤더를 가리키는 포인터를 리턴
- * 🤔 왜 (char *)로 형 변환을 할까?
- * => 포인터 연산을 바이트 단위로 정확하게 하기 위해 1바이트인 char 타입의 포인터로 변환한다.
+ * 블록 헤더의 주소 가져오기
  */
 #define HDRP(bp) ((char *)(bp)-WSIZE)
 
-/* 블록 포인터 bp가 주어지면 블록의 풋터를 가리키는 포인터를 리턴 */
+/* 블록 푸터의 주소 가져오기 */
 #define FTRP(bp) ((char *)(bp) + GET_SIZE(HDRP(bp)) - DSIZE)
 
-/*
- * 다음 블록의 포인터를 리턴하는 함수
- * GET_SIZE(((char *)(bp)-WSIZE))는 현재 블록의 헤더에 있는 사이즈 정보를 읽어옴
- */
-#define NEXT_BLKP(bp) ((char *)(bp) + GET_SIZE(((char *)(bp)-WSIZE)))
+/* 헤더와 푸터를 포함한 블록의 사이즈 가져오기 */
+#define GET_TOTAL_SIZE(p) (GET_SIZE(p) + HDR_FTR_SIZE)
 
-/*
- * 이전 블록의 포인터를 리턴하는 함수
- * GET_SIZE((char *)(bp)-DSIZE)는 이전 블록의 footer에 있는 사이즈 정보를 읽어옴
- */
-#define PREV_BLKP(bp) ((char *)(bp)-GET_SIZE((char *)(bp)-DSIZE))
+/* free_lists의 i번째 요소 가져오기 */
+#define GET_FREE_LIST_PTR(i) (*(free_lists + i))
 
-/*************** For Explicit Free List **********************/
+/* free_lists의 i번째 요소 값 설정하기 */
+#define SET_FREE_LIST_PTR(i, ptr) (*(free_lists + i) = ptr)
 
-#define GET_PRED_FREEP(bp) (*(void **)(bp))
+/* 가용 블록의 predecessor, successor 주소값 셋팅 */
+#define SET_PTR(p, ptr) (*(char **)(p) = (char *)(p))
 
-#define GET_SUCC_FREEP(bp) (*(void **)(bp + WSIZE))
+/* 가용 블록 내에 predecessor 주소가 적힌 곳의 포인터 가져오기 */
+#define GET_PTR_PRED_FIELD(header_ptr) ((char **)(header_ptr) + HDR_SIZE)
 
-/*************************************************************/
+/* 가용 블록 내에 successor 주소가 적힌 곳의 포인터 가져오기 */
+#define GET_PTR_SUCC_FIELD(header_ptr) ((char **)(header_ptr) + HDR_SIZE + PRED_FIELD_SIZE)
 
-/* 힙의 시작 지점을 가리키는 포인터 */
-static void *heap_listp;
+/* 가용 블록의 predecessor 메모리 공간에 저장된 주소값 가져오기 */
+#define GET_PRED(bp) (*GET_PTR_PRED_FIELD(bp))
 
-/* 명시적 가용 리스트의 시작 지점을 가리키는 포인터 */
-static void *explicit_listp = NULL;
+/* 가용 블록의 successor 메모리 공간에 저장된 주소값 가져오기 */
+#define GET_SUCC(bp) (*(GET_PTR_SUCC_FIELD(bp)))
 
-/* 힙 메모리 영역 확장하기 */
+/* 이전 블록의 포인터 가져오기 */
+#define PREV_BLOCK_IN_HEAP(header_p) ((char **)(header_p)-GET_TOTAL_SIZE((char **)(header_p)-FTR_SIZE))
+
+/* 다음 블록의 포인터 가져오기 */
+#define NEXT_BLOCK_IN_HEAP(header_p) (FTRP(header_p) + FTR_SIZE)
+
+/************************************** 변수 선언부 *******************************************/
+
+static char **free_lists;
+static char **heap_ptr;
+
+/************************************** 함수 선언부 *******************************************/
+
+static size_t find_free_list_index(size_t words);
 static void *extend_heap(size_t words);
-
-/* 가용 블록 연결하기 */
 static void *coalesce(void *bp);
+static void *find_free_block(size_t words);
+static void alloc_free_block(void *bp, size_t words);
+static void place_block_into_free_list(char **bp);
+static void remove_block_from_free_list(char **bp);
+static int round_up_power_2(int x);
+void *mm_realloc_wrapped(void *ptr, size_t size, int buffer_size);
+int mm_check();
 
-/* 가용한 블록 검색하기 (first-fit) */
-static void *find_fit(size_t asize);
+/* 주어진 수 x보다 크거나 같은 2의 제곱 중에서 가장 작은 값을 찾는 함수*/
+static int round_up_power_2(int x)
+{
+    if (x < 0)
+        return 0;
+    --x;
+    x |= x >> 1;
+    x |= x >> 2;
+    x |= x >> 4;
+    x |= x >> 8;
+    x |= x >> 16;
+    return x + 1;
+}
 
-/* 할당된 블록 배치하기 */
-static void place(void *bp, size_t asize);
-
-/* 명시적 가용 리스트의 맨 앞에 삽입하기 */
-static void insert_in_head(void *ptr);
-
-/* 명시적 가용 리스트에 있는 블록 제거하기*/
-static void remove_block(void *ptr);
-
-/*
- * malloc 패키지 초기화하기
- */
+/* mm_init - malloc 패키지 초기화하기 */
 int mm_init(void)
 {
-    // 힙 초기화하기 (시스템 호출이 실패하면 -1을 반환함)
-    if ((heap_listp = mem_sbrk(6 * WSIZE)) == (void *)-1)
+    // MAX POWER만큼 segregated free list의 메모리 할당 받기
+    if ((long)(free_lists = mem_sbrk(MAX_POWER * sizeof(char *))) == -1)
         return -1;
 
-    PUT(heap_listp, 0);                              // Alignment padding (힙의 시작주소에 0 할당)
-    PUT(heap_listp + WSIZE, PACK(4 * WSIZE, 1));     // 프롤로그 헤더 16/1
-    PUT(heap_listp + 2 * WSIZE, NULL);               // 프롤로그 PRED 포인터 NULL로 초기화
-    PUT(heap_listp + 3 * WSIZE, NULL);               // 프롤로그 SUCC 포인터 NULL로 초기화
-    PUT(heap_listp + 4 * WSIZE, PACK(4 * WSIZE, 1)); // 프롤로그 풋터 16/1
-    PUT(heap_listp + 5 * WSIZE, PACK(0, 1));         // 에필로그 헤더 0/1
-
-    // 에필로그 블록의 주소를 명시적 가용 리스트의 head로 설정
-    explicit_listp = heap_listp + DSIZE;
-
-    // CHUCKSIZE만큼 힙 확장시키기
-    if (extend_heap(CHUNKSIZE / WSIZE) == NULL) // word가 몇개인지 확인해서 넣으려고(DSIZE로 나눠도 됨)
-        return -1;
-
-    return 0;
-}
-
-/*
- * mm_malloc - 메모리 할당하기
- */
-void *mm_malloc(size_t size)
-{
-    size_t asize;      // Adjusted block size
-    size_t extendsize; // Amount to extend heap if no fit
-
-    void *bp; // todo
-
-    // 유효하지 않은 요청인 경우 NULL 리턴
-    if (size == 0)
-        return NULL;
-
-    // overhead 추가와 정렬요건을 충족을 위해 블록사이즈 조정
-    // overhead란 시스템이 특정 작업을 수행하는 데 필요한 추가적인 리소스나 시간을 가리키는 용어로 여기에서는 헤더와 푸터를 의미
-    if (size <= DSIZE)
-        asize = 2 * DSIZE; // 더블 워드 정렬 조건을 충족하기 위해
-    else
-        asize = DSIZE * ((size + (DSIZE) + (DSIZE - 1)) / DSIZE); // size에 가장 가까운 double word size의 배수 찾기
-
-    // 가용한 블록 찾기
-    if ((bp = find_fit(asize)) != NULL)
+    // segregated free list 초기화
+    for (int i = 0; i <= MAX_POWER; i++)
     {
-        place(bp, asize);
-        return bp;
+        SET_FREE_LIST_PTR(i, NULL);
     }
 
-    // 만약 가용한 블록이 없는 경우 힙 메모리 영역을 확장하고 블록을 배치
-    extendsize = MAX(asize, CHUNKSIZE);
-    if ((bp = extend_heap(extendsize / WSIZE)) == NULL)
-        return NULL;
-    place(bp, asize);
-
-    return bp;
-}
-
-/*
- * mm_free - 메모리 반환하기.
- */
-void mm_free(void *bp)
-{
-    size_t size = GET_SIZE(HDRP(bp));
-
-    // 헤더와 푸터의 할당 비트를 0으로 수정하여 해제
-    PUT(HDRP(bp), PACK(size, 0));
-    PUT(FTRP(bp), PACK(size, 0));
-
-    coalesce(bp);
-}
-
-/*
- * mm_realloc - 메모리 할당 사이즈 변경
- */
-void *mm_realloc(void *bp, size_t size)
-{
-    void *old_bp = bp;
-    void *new_bp = bp;
-    size_t copy_size;
-
-    // size가 0인 경우 메모리 반환만 수행
-    if (size <= 0)
-    {
-        mm_free(bp);
-        return 0;
-    }
-
-    // 새로운 메모리 블록 할당하기
-    new_bp = mm_malloc(size);
-    if (new_bp == NULL)
-        return NULL;
-
-    // 기존 데이터 복사
-    copy_size = GET(HDRP(old_bp)) - DSIZE;
-    if (size < copy_size)
-        copy_size = size;
-    memcpy(new_bp, old_bp, copy_size);
-
-    // 이전 메모리 블록 해제
-    mm_free(old_bp);
-
-    return new_bp;
-}
-
-/* 힙 영역 확장하기 */
-static void *extend_heap(size_t words)
-{
-    char *bp;
-    size_t size;
-
-    // 더블 워드 정렬을 유지하기 위해 짝수 사이즈의 words를 할당
-    size = (words % 2) ? (words + 1) * WSIZE : words * WSIZE;
-    if ((long)(bp = mem_sbrk(size)) == -1)
-        return NULL;
-
-    // free 상태 블록의 헤더와 푸터를 초기화하고 새로운 에필로그 헤더를 초기화
-    PUT(HDRP(bp), PACK(size, 0));         // Free block header
-    PUT(FTRP(bp), PACK(size, 0));         // Free block footer
-    PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1)); // New epilogue header
-
-    // 전후로 가용 블록이 있다면 연결
-    return coalesce(bp);
-}
-
-/* 가용 블록 연결하기*/
-static void *coalesce(void *bp)
-{
-    size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(bp))); // 이전 블록의 할당 여부
-    size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp))); // 다음 블록의 할당 여부
-    size_t size = GET_SIZE(HDRP(bp));
-
-    // Case 1. 이전 블록, 다음 블록 모두 할당된 상태
-    if (prev_alloc && next_alloc)
-    {
-        insert_in_head(bp); // 연결이 된 블록을 free list 에 추가
-        return bp;
-    }
-
-    // Case 2. 이전 블록은 할당된 상태, 다음 블록은 가용한 상태
-    else if (prev_alloc && !next_alloc)
-    {
-        remove_block(NEXT_BLKP(bp));
-        size += GET_SIZE(HDRP(NEXT_BLKP(bp))); // 현재 블록의 사이즈 + 다음 블록 사이즈
-        PUT(HDRP(bp), PACK(size, 0));          // 헤더 사이즈 수정
-        PUT(FTRP(bp), PACK(size, 0));          // 푸터 사이즈 수정
-    }
-
-    // Case 3. 이전 블록은 가용한 상태, 다음 불록은 할당된 상태
-    else if (!prev_alloc && next_alloc)
-    {
-        remove_block(PREV_BLKP(bp));
-        size += GET_SIZE(HDRP(PREV_BLKP(bp)));
-        bp = PREV_BLKP(bp);
-        PUT(HDRP(bp), PACK(size, 0));
-        PUT(FTRP(bp), PACK(size, 0));
-    }
-
-    // Case 4. 이전 블록, 다음 블록 모두 가용한 상태
-    else 
-    {
-        remove_block(PREV_BLKP(bp));
-        remove_block(NEXT_BLKP(bp));
-        size += GET_SIZE(HDRP(PREV_BLKP(bp))) + GET_SIZE(FTRP(NEXT_BLKP(bp)));
-        PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
-        PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0));
-        bp = PREV_BLKP(bp);
-    }
-
-    // 명시적 가용 리스트의 맨 앞으로 넣어줌
-    insert_in_head(bp);
-
-    return bp;
-}
-
-/* 가용한 블록 찾기 */
-static void *find_fit(size_t asize)
-{
-    void *bp;
-
-    // 명시적 가용 리스트에서 asize보다 사이즈가 큰 블록을 탐색 (명시적 가용 리스트의 끝, 즉 프롤로그 블록에 이르기 전까지)
-    for (bp = explicit_listp; GET_ALLOC(HDRP(bp)) != 1; bp = GET_SUCC_FREEP(bp))
-    {
-        if (GET_SIZE(HDRP(bp)) >= asize)
-        {
-            return bp;
-        }
-    }
-
-    return NULL; // 가용한 블록이 없는 경우
-}
-
-
-/* 할당된 블록 배치하기 */
-static void place(void *bp, size_t asize)
-{
-    // 현재 가용 블록의 사이즈
-    size_t fsize = GET_SIZE(HDRP(bp));
-
-    // 할당된 블록은 명시적 블록 리스트에서 제거
-    remove_block(bp);
-
-    // (현재 가용 사이즈 - 필요한 사이즈) > 최소 블록의 크기(= 2 * DSIZE)라면 asize만큼만 사용하고 나머지는 free 상태로 두기
-    if ((fsize - asize) >= (2 * DSIZE))
-    {
-        PUT(HDRP(bp), PACK(asize, 1));
-        PUT(FTRP(bp), PACK(asize, 1));
-        bp = NEXT_BLKP(bp);
-        PUT(HDRP(bp), PACK(fsize - asize, 0));
-        PUT(FTRP(bp), PACK(fsize - asize, 0));
-        // 명시적 가용 리스트의 맨 앞으로 넣어줌
-        insert_in_head(bp);
-    }
-    else
-    {
-        PUT(HDRP(bp), PACK(fsize, 1));
-        PUT(FTRP(bp), PACK(fsize, 1));
-    }
-}
-
-/* 새로 반환된 가용 블록을 명시적 가용 리스트의 맨 앞에 넣기 (LIFO 방식) */
-void insert_in_head(void *bp)
-{
-    GET_SUCC_FREEP(bp) = explicit_listp; // 가장 앞에 있는 블록이므로 NULL 셋팅
-    GET_PRED_FREEP(bp) = NULL; // 기존에 맨 앞에 있던 블록을 다음 블록으로 셋팅
-    GET_PRED_FREEP(explicit_listp) = bp; // 기존에 맨 앞에 있던 블록이 현재 블록을 이전 블록으로 가리키도록 수정
-    explicit_listp = bp; // 명시적 가용 리스트의 시작 지점 변경
-}
-
-/* 명시적 가용 리스트에서 가용 볼록 제거하기 */
-void remove_block(void *bp)
-{
-    // 만약 첫 번째 블록이라면
-    if (bp == explicit_listp)
-    {
-        GET_PRED_FREEP(GET_SUCC_FREEP(bp)) = NULL;
-        explicit_listp = GET_SUCC_FREEP(bp);
-    }
-    else
-    {
-        GET_SUCC_FREEP(GET_PRED_FREEP(bp)) = GET_SUCC_FREEP(bp);
-        GET_PRED_FREEP(GET_SUCC_FREEP(bp)) = GET_PRED_FREEP(bp);
-    }
+    // 
+    mem_sbrk(WORD_SIZE);
 }
