@@ -54,23 +54,20 @@ team_t team = {
 /* x보다 크면서 가장 가까운 짝수 찾기 */
 #define EVENIZE(x) ((x + 1) & ~1)
 
-/*
- * 블록 사이즈 가져오기
- * how? 16진수 0x7은 10진수로 7을 의미. 이를 이진수로 변환하면 0111이 되고 NOT 연산자 ~를 붙이면 1000이 됨. 주소값 p와 and 연산을 하면 비트의 마지막 세 자리를 0으로 바꿈
- */
-#define GET_SIZE(p) (GET(p) & ~0x7)
+/* 주어진 사이즈의 비트 마스크 생성하기 */
+#define GET_MASK(size) ((1 << size) - 1)
 
-/*
- * 블록의 할당 여부 가져오기
- * how? 마지막 자리를 제외하고 모두 0으로 바꿈. 할당이 되어 있다면 마지막 자리가 1로 반환되고, 할당이 안 되어 있다면 마지막 자리가 0으로 반환됨
- */
-#define GET_STATUS(p) (GET(p) & 0x1)
+/* 블록 사이즈 가져오기 */
+#define GET_SIZE(p) ((GET_WORD(p) & ~GET_MASK(STATUS_BIT_SIZE)) >> STATUS_BIT_SIZE)
+
+/* 블록의 할당 여부 가져오기 */
+#define GET_STATUS(p) (GET_WORD(p) & 0x1)
 
 /*
  * 블록의 크기와 할당 비트를 통합해서 header와 footer에 저장할 수 있는 값 만들기
  * Pack a size and allocated bit into a word
  */
-#define PACK(size, alloc) ((size) | (alloc))
+#define PACK(size, status) ((size << STATUS_BIT_SIZE) | (status))
 
 /*
  * 블록 헤더의 주소 가져오기
@@ -90,16 +87,16 @@ team_t team = {
 #define SET_FREE_LIST_PTR(i, ptr) (*(free_lists + i) = ptr)
 
 /* 가용 블록의 predecessor, successor 주소값 셋팅 */
-#define SET_PTR(p, ptr) (*(char **)(p) = (char *)(p))
+#define SET_PTR(p, ptr) (*(char **)(p) = (char *)(ptr))
 
 /* 가용 블록 내에 predecessor 주소가 적힌 곳의 포인터 가져오기 */
-#define GET_PTR_PRED_FIELD(header_ptr) ((char **)(header_ptr) + HDR_SIZE)
+#define GET_PTR_PRED_FIELD(ptr) ((char **)(ptr) + HDR_SIZE)
 
 /* 가용 블록 내에 successor 주소가 적힌 곳의 포인터 가져오기 */
-#define GET_PTR_SUCC_FIELD(header_ptr) ((char **)(header_ptr) + HDR_SIZE + PRED_FIELD_SIZE)
+#define GET_PTR_SUCC_FIELD(ptr) ((char **)(ptr) + HDR_SIZE + PRED_FIELD_SIZE)
 
 /* 가용 블록의 predecessor 메모리 공간에 저장된 주소값 가져오기 */
-#define GET_PRED(bp) (*GET_PTR_PRED_FIELD(bp))
+#define GET_PRED(bp) (*(GET_PTR_PRED_FIELD(bp)))
 
 /* 가용 블록의 successor 메모리 공간에 저장된 주소값 가져오기 */
 #define GET_SUCC(bp) (*(GET_PTR_SUCC_FIELD(bp)))
@@ -119,30 +116,15 @@ static char **heap_ptr;
 
 static void *extend_heap(size_t words);
 static void place_block_into_free_list(char **bp);
+static int round_up_power_2(int x);
 static size_t find_free_list_index(size_t words);
+static void *find_free_block(size_t words);
 static void alloc_free_block(void *bp, size_t words);
 static void remove_block_from_free_list(char **bp);
 static void *coalesce(void *bp);
-static void *find_free_block(size_t words);
-
-
-static int round_up_power_2(int x);
 void *mm_realloc_wrapped(void *ptr, size_t size, int buffer_size);
-int mm_check();
 
-/* 주어진 수 x보다 크거나 같은 2의 제곱 중에서 가장 작은 값을 찾는 함수*/
-static int round_up_power_2(int x)
-{
-    if (x < 0)
-        return 0;
-    --x;
-    x |= x >> 1;
-    x |= x >> 2;
-    x |= x >> 4;
-    x |= x >> 8;
-    x |= x >> 16;
-    return x + 1;
-}
+/************************************** 함수 구현부 *******************************************/
 
 /* mm_init: malloc 패키지 초기화하기 */
 int mm_init(void)
@@ -200,10 +182,6 @@ void *mm_malloc(size_t size)
     size_t extend_size;
     char **bp;
 
-    // 2) 해당 가용 블록 리스트 내에 가용 블록이 있으면 할당한다.
-    // 3) 가용 블록이 없으면 다음으로 큰 size class의 가용 블록 리스트로 이동하여 탐색한다.
-    // 4) 모든 가용 블록 리스트를 탐색했는데도 가용 볼록이 없으면 힙 영역을 확장한다.
-
     // 할당하려는 사이즈에 적합한 블록이 있는지 찾았는데 없는 경우 힙 영역을 확장
     if ((bp = find_free_block(words)) == NULL)
     {
@@ -218,7 +196,7 @@ void *mm_malloc(size_t size)
     }
 
     remove_block_from_free_list(bp); // 사용하려는 블록을 가용 리스트에서 제거
-    alloc_free_block(bp, words); // 가용 블록에서 필요한 만큼 메모리 할당하고, 남은 블록은 다시 가용 리스트에 추가
+    alloc_free_block(bp, words);     // 가용 블록에서 필요한 만큼 메모리 할당하고, 남은 블록은 다시 가용 리스트에 추가
 
     return bp + HDR_SIZE;
 }
@@ -240,6 +218,160 @@ void mm_free(void *ptr)
     place_block_into_free_list(ptr);
 }
 
+/* mm_realloc: 메모리 재할당하기 */
+// void *mm_realloc(void *bp, size_t size)
+// {
+//     void *old_bp = bp;
+//     void *new_bp = bp;
+//     size_t copy_size;
+
+//     // size가 0인 경우 메모리 반환만 수행
+//     if (size <= 0)
+//     {
+//         mm_free(bp);
+//         return 0;
+//     }
+
+//     // 새로운 메모리 블록 할당하기
+//     new_bp = mm_malloc(size);
+//     if (new_bp == NULL)
+//         return NULL;
+
+//     // 기존 데이터 복사
+//     copy_size = GET_SIZE(bp);
+//     if (size < copy_size)
+//         copy_size = size;
+//     memcpy(new_bp, old_bp, copy_size);
+
+//     // 이전 메모리 블록 해제
+//     mm_free(old_bp);
+
+//     return new_bp;
+// }
+
+int round_to_thousand(size_t x)
+{
+    return x % 1000 >= 500 ? x + 1000 - x % 1000 : x - x % 1000;
+}
+
+// Calculate the diff between previous request size and current request
+// Determine the buffer size of the newly reallocated block based on this diff
+// Call mm_realloc_wrapped to perform the actual reallocation
+void *mm_realloc(void *ptr, size_t size)
+{
+    static int previous_size;
+    int buffer_size;
+    int diff = abs(size - previous_size);
+
+    if (diff < 1 << 12 && diff % round_up_power_2(diff))
+    {
+        buffer_size = round_up_power_2(diff);
+    }
+    else
+    {
+        buffer_size = round_to_thousand(size);
+    }
+
+    void *return_value = mm_realloc_wrapped(ptr, size, buffer_size);
+
+    previous_size = size;
+    return return_value;
+}
+
+// Realloc a block
+/*
+    mm_realloc:
+    if the pointer given is NULL, behaves as malloc would
+    if the size given is zero, behaves as free would
+
+    As an optamizing, checks if it is possible to use neighboring blocks
+    and coalesce so as to avoid allocating new blocks.
+
+    If that is not possible, simple reallocates based on alloc and free.
+
+    Uses buffer to not have to reallocate often.
+*/
+void *mm_realloc_wrapped(void *ptr, size_t size, int buffer_size)
+{
+
+    // equivalent to mm_malloc if ptr is NULL
+    if (ptr == NULL)
+    {
+        return mm_malloc(ptr);
+    }
+
+    // adjust to be at start of block
+    char **old = (char **)ptr - 1;
+    char **bp = (char **)ptr - 1;
+
+    // get intended and current size
+    size_t new_size = ALIGN(size) / WORD_SIZE; // in words
+    size_t size_with_buffer = new_size + buffer_size;
+    size_t old_size = GET_SIZE(bp); // in words
+
+    if (size_with_buffer == old_size && new_size <= size_with_buffer)
+    {
+        return bp + HDR_SIZE;
+    }
+
+    if (new_size == 0)
+    {
+        mm_free(ptr);
+        return NULL;
+    }
+    else if (new_size > old_size)
+    {
+        if (GET_SIZE(NEXT_BLOCK_IN_HEAP(bp)) + old_size + 2 >= size_with_buffer &&
+            GET_STATUS(PREV_BLOCK_IN_HEAP(bp)) == TAKEN &&
+            GET_STATUS(NEXT_BLOCK_IN_HEAP(bp)) == FREE)
+        { // checks if possible to merge with previous block in memory
+            PUT_WORD(bp, PACK(old_size, FREE));
+            PUT_WORD(FTRP(bp), PACK(old_size, FREE));
+
+            bp = coalesce(bp);
+            alloc_free_block(bp, size_with_buffer);
+        }
+        else if (GET_SIZE(PREV_BLOCK_IN_HEAP(bp)) + old_size + 2 >= size_with_buffer &&
+                 GET_STATUS(PREV_BLOCK_IN_HEAP(bp)) == FREE &&
+                 GET_STATUS(NEXT_BLOCK_IN_HEAP(bp)) == TAKEN)
+        { // checks if possible to merge with next block in memory
+            PUT_WORD(bp, PACK(old_size, FREE));
+            PUT_WORD(FTRP(bp), PACK(old_size, FREE));
+
+            bp = coalesce(bp);
+
+            memmove(bp + 1, old + 1, old_size * WORD_SIZE);
+            alloc_free_block(bp, size_with_buffer);
+        }
+        else if (GET_SIZE(PREV_BLOCK_IN_HEAP(bp)) + GET_SIZE(NEXT_BLOCK_IN_HEAP(bp)) + old_size + 4 >= size_with_buffer &&
+                 GET_STATUS(PREV_BLOCK_IN_HEAP(bp)) == FREE &&
+                 GET_STATUS(NEXT_BLOCK_IN_HEAP(bp)) == FREE)
+        { // checks if possible to merge with both prev and next block in memory
+            PUT_WORD(bp, PACK(old_size, FREE));
+            PUT_WORD(FTRP(bp), PACK(old_size, FREE));
+
+            bp = coalesce(bp);
+
+            memmove(bp + 1, old + 1, old_size * WORD_SIZE);
+            alloc_free_block(bp, size_with_buffer);
+        }
+        else
+        { // end case: if no optimization possible, just do brute force realloc
+            bp = (char **)mm_malloc(size_with_buffer * WORD_SIZE + WORD_SIZE) - 1;
+
+            if (bp == NULL)
+            {
+                return NULL;
+            }
+
+            memcpy(bp + 1, old + 1, old_size * WORD_SIZE);
+            mm_free(old + 1);
+        }
+    }
+
+    return bp + HDR_SIZE;
+}
+
 /*
 extend_heap: 힙 영역 확장하기
 - 힙 영역 확장에 성공하는 경우 새로운 블록의 헤더와 푸터 영역을 정의하고, 해당 블록의 포인터를 반환
@@ -255,12 +387,13 @@ static void *extend_heap(size_t words)
     if ((long)(bp = mem_sbrk((words_extend_total)*WORD_SIZE)) == -1)
         return NULL;
 
+    // 힙 영역 마지막에 에필로그 블록 추가
+    bp -= EPILOG_SIZE;
+
     // 새로운 가용 블록의 헤더와 푸터에 값 셋팅
     PUT_WORD(bp, PACK(words_extend, FREE));
     PUT_WORD(FTRP(bp), PACK(words_extend, FREE));
 
-    // 힙 영역 마지막에 에필로그 블록 추가
-    bp -= EPILOG_SIZE;
     end_pointer = bp + words_extend_total;
     PUT_WORD(end_pointer, PACK(0, TAKEN));
     PUT_WORD(FTRP(end_pointer), PACK(0, TAKEN));
@@ -285,7 +418,7 @@ static void place_block_into_free_list(char **bp)
     if (front_ptr == NULL)
     {
         SET_PTR(GET_PTR_PRED_FIELD(bp), NULL);
-        SET_PTR(GET_PTR_PRED_FIELD(bp), NULL);
+        SET_PTR(GET_PTR_SUCC_FIELD(bp), NULL);
         SET_FREE_LIST_PTR(index, bp); // 가용 리스트의 시작 지점으로 설정
         return;
     }
@@ -322,6 +455,20 @@ static void place_block_into_free_list(char **bp)
         SET_PTR(GET_PTR_PRED_FIELD(front_ptr), bp);
         return;
     }
+}
+
+/* 주어진 수 x보다 크거나 같은 2의 제곱 중에서 가장 작은 값을 찾는 함수*/
+static int round_up_power_2(int x)
+{
+    if (x < 0)
+        return 0;
+    --x;
+    x |= x >> 1;
+    x |= x >> 2;
+    x |= x >> 4;
+    x |= x >> 8;
+    x |= x >> 16;
+    return x + 1;
 }
 
 /* find_free_list_index: 주어진 words 사이즈가 속하는 size class, 즉 가용 리스트 상의 인덱스를 찾는 함수 */
@@ -423,11 +570,72 @@ static void remove_block_from_free_list(char **bp)
 
     if (GET_SIZE(bp) == 0)
         return;
-    
+
     if (prev_block == NULL) // 해당 size class 리스트의 맨 앞에 있는 가장 큰 블록인 경우
     {
         index = find_free_list_index(GET_SIZE(bp)); // 블록이 포함된 가용 리스트의 인덱스
-        GET_FREE_LIST_PTR(index) = next_block; // 다음 블록을 가용 리스트의 첫 번째 블록으로 설정
-        
+        GET_FREE_LIST_PTR(index) = next_block;      // 다음 블록을 가용 리스트의 첫 번째 블록으로 설정
     }
+    else
+    {
+        SET_PTR(GET_PTR_SUCC_FIELD(prev_block), next_block); // 이전 블록이 다음 블록을 가리키도록 수정
+    }
+
+    if (next_block != NULL)
+    {
+        SET_PTR(GET_PTR_PRED_FIELD(next_block), prev_block);
+    }
+
+    // 현재 블록의 predecessor와 successor를 NULL로 셋팅
+    SET_PTR(GET_PTR_PRED_FIELD(bp), NULL);
+    SET_PTR(GET_PTR_SUCC_FIELD(bp), NULL);
+}
+
+/* coalesce: 가용 블록 연결하기 */
+static void *coalesce(void *bp)
+{
+    char **prev_block = PREV_BLOCK_IN_HEAP(bp);
+    char **next_block = NEXT_BLOCK_IN_HEAP(bp);
+    size_t prev_status = GET_STATUS(prev_block);
+    size_t next_status = GET_STATUS(next_block);
+    size_t new_size = GET_SIZE(bp);
+
+    // Case 1
+    if (prev_status == TAKEN && next_status == TAKEN)
+    {
+        return bp;
+    }
+    // Case 2
+    else if (prev_status == TAKEN && next_status == FREE)
+    {
+        // 다음 블록을 우선 가용 리스트에서 제거
+        remove_block_from_free_list(next_block);
+        // 다음 블록을 합친 사이즈로 가용 블록의 헤더와 푸터 업데이트
+        new_size += GET_TOTAL_SIZE(next_block);
+        PUT_WORD(bp, PACK(new_size, FREE));
+        PUT_WORD(FTRP(next_block), PACK(new_size, FREE));
+    }
+    // Case 3
+    else if (prev_status == FREE && next_status == TAKEN)
+    {
+        // 이전 블록을 우선 가용 리스트에서 제거
+        remove_block_from_free_list(prev_block);
+        // 이전 블록을 합친 사이즈로 가용 블록의 헤더와 푸터 업데이트
+        new_size += GET_TOTAL_SIZE(prev_block);
+        PUT_WORD(prev_block, PACK(new_size, FREE));
+        PUT_WORD(FTRP(bp), PACK(new_size, FREE));
+        bp = prev_block;
+    }
+    // Case 4
+    else if (prev_status == FREE && next_status == FREE)
+    {
+        remove_block_from_free_list(prev_block);
+        remove_block_from_free_list(next_block);
+        new_size += GET_TOTAL_SIZE(prev_block) + GET_TOTAL_SIZE(next_block);
+        PUT_WORD(prev_block, PACK(new_size, FREE));
+        PUT_WORD(FTRP(next_block), PACK(new_size, FREE));
+        bp = prev_block;
+    }
+
+    return bp;
 }
