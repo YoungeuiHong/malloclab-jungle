@@ -185,7 +185,8 @@ int mm_init(void)
 /* mm_malloc: 메모리 할당하기 */
 void *mm_malloc(size_t size)
 {
-    if (size == 0) return NULL;
+    if (size == 0)
+        return NULL;
 
     // CHUNK 사이즈보다 작으면 가장 가까운 2의 제곱 사이즈로 만들기
     if (size <= CHUNK * WORD_SIZE)
@@ -198,12 +199,19 @@ void *mm_malloc(size_t size)
     char **bp;
 
     // 2) 해당 가용 블록 리스트 내에 가용 블록이 있으면 할당한다.
-
-
-
     // 3) 가용 블록이 없으면 다음으로 큰 size class의 가용 블록 리스트로 이동하여 탐색한다.
-
     // 4) 모든 가용 블록 리스트를 탐색했는데도 가용 볼록이 없으면 힙 영역을 확장한다.
+
+
+    // 할당하려는 사이즈에 적합한 블록이 있는지 찾았는데 없는 경우 힙 영역을 확장
+    if ((bp = find_free_block(words)) == NULL)
+    {
+        extend_size = words > CHUNK ? words : CHUNK;
+        if ((bp = extend_heap(extend_size)) == NULL)
+            return NULL;
+
+        
+    }
 }
 
 /* mm_free: 메모리 반환하기 */
@@ -251,7 +259,7 @@ static void *extend_heap(size_t words)
     return bp;
 }
 
-/* 블록 사이즈에 따라 적절한 위치에 새로운 가용 블록 추가하기 */
+/* place_block_into_free_list: 블록 사이즈에 따라 적절한 위치에 새로운 가용 블록 추가하기 */
 static void place_block_into_free_list(char **bp)
 {
     size_t size = GET_SIZE(bp); // 새로 배치할 가용 블록의 사이즈
@@ -297,16 +305,17 @@ static void place_block_into_free_list(char **bp)
         SET_PTR(GET_PTR_SUCC_FIELD(bp), NULL);
         return;
     }
-    else { // 가용 리스트의 중간에 집어넣는 경우
+    else
+    { // 가용 리스트의 중간에 집어넣는 경우
         SET_PTR(GET_PTR_SUCC_FIELD(prev_ptr), bp);
         SET_PTR(GET_PTR_PRED_FIELD(bp), prev_ptr);
         SET_PTR(GET_PTR_SUCC_FIELD(bp), front_ptr);
         SET_PTR(GET_PTR_PRED_FIELD(front_ptr), bp);
         return;
-    }   
+    }
 }
 
-/* 주어진 words 사이즈가 속하는 size class, 즉 가용 리스트 상의 인덱스를 찾는 함수 */
+/* find_free_list_index: 주어진 words 사이즈가 속하는 size class, 즉 가용 리스트 상의 인덱스를 찾는 함수 */
 static size_t find_free_list_index(size_t words)
 {
     int index = 0;
@@ -320,10 +329,50 @@ static size_t find_free_list_index(size_t words)
     return index;
 }
 
+/* find_free_block: 전체 Segregated Free List에서 주어진 words 사이즈에 적합한 가용 블록 찾기 */
 static void *find_free_block(size_t words)
 {
     char **bp;
-    size_t index = find_free_list_index(words); // 주어진 words 사이즈에 
+    size_t index = find_free_list_index(words); // 주어진 words 사이즈보다 큰 size class 중 가장 작은 size class의 가용 리스트 찾기
 
+    // 사용할 수 있는 가용 블록을 찾을 때까지 탐색
+    while (index <= MAX_POWER)
+    {
+        // 현재 size class의 가용 리스트가 비어 있지 않고, 블록의 크기도 충분히 커서 메모리 할당이 가능한 경우
+        if ((bp = GET_FREE_LIST_PTR(index)) != NULL && GET_SIZE(bp) >= words)
+        {
+            // 가용 리스트를 순회하며 사이즈가 가장 적합한 블록 찾기
+            while (1)
+            {
+                if (GET_SIZE(bp) == words)
+                    return bp;
+
+                // 다음 블록이 없거나, 다음 불록이 필요한 사이즈보다 작으면 현재 블록을 리턴
+                if (GET_SUCC(bp) == NULL || GET_SIZE(GET_SUCC(bp)) < words)
+                    return bp;
+
+                bp = GET_SUCC(bp);
+            }
+        }
+
+        index++;
+    }
+
+    // 만약 모든 리스트를 탐색했는데도 사용할 수 있는 가용 블록이 없는 경우 NULL 리턴
+    return NULL;
+}
+
+/* 
+alloc_free_block: 가용 블록에서 메모리 할당하기
+*/
+static void alloc_free_block(void *bp, size_t words)
+{
+    size_t bp_tot_size = GET_SIZE(bp) + HDR_FTR_SIZE; // 가용 블록의 사이즈 (= 페이로드 + 헤더 + 푸터)
+    size_t needed_tot_size = words + HDR_FTR_SIZE; // 할당 받아야 하는 사이즈
+    size_t left_block_size = bp_tot_size - needed_tot_size - HDR_FTR_SIZE; // 할당하고 남는 블록의 사이즈
+
+    char **new_block;
+
+    if ()
 
 }
