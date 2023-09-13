@@ -120,10 +120,12 @@ static char **heap_ptr;
 static void *extend_heap(size_t words);
 static void place_block_into_free_list(char **bp);
 static size_t find_free_list_index(size_t words);
-static void *coalesce(void *bp);
-static void *find_free_block(size_t words);
 static void alloc_free_block(void *bp, size_t words);
 static void remove_block_from_free_list(char **bp);
+static void *coalesce(void *bp);
+static void *find_free_block(size_t words);
+
+
 static int round_up_power_2(int x);
 void *mm_realloc_wrapped(void *ptr, size_t size, int buffer_size);
 int mm_check();
@@ -202,7 +204,6 @@ void *mm_malloc(size_t size)
     // 3) 가용 블록이 없으면 다음으로 큰 size class의 가용 블록 리스트로 이동하여 탐색한다.
     // 4) 모든 가용 블록 리스트를 탐색했는데도 가용 볼록이 없으면 힙 영역을 확장한다.
 
-
     // 할당하려는 사이즈에 적합한 블록이 있는지 찾았는데 없는 경우 힙 영역을 확장
     if ((bp = find_free_block(words)) == NULL)
     {
@@ -210,8 +211,16 @@ void *mm_malloc(size_t size)
         if ((bp = extend_heap(extend_size)) == NULL)
             return NULL;
 
-        
+        // 새로 할당 받은 힙 영역에서 필요한 만큼 메모리 할당하고 나머지는 가용 리스트에 추가
+        alloc_free_block(bp, words);
+
+        return bp + HDR_SIZE;
     }
+
+    remove_block_from_free_list(bp); // 사용하려는 블록을 가용 리스트에서 제거
+    alloc_free_block(bp, words); // 가용 블록에서 필요한 만큼 메모리 할당하고, 남은 블록은 다시 가용 리스트에 추가
+
+    return bp + HDR_SIZE;
 }
 
 /* mm_free: 메모리 반환하기 */
@@ -362,17 +371,63 @@ static void *find_free_block(size_t words)
     return NULL;
 }
 
-/* 
+/*
 alloc_free_block: 가용 블록에서 메모리 할당하기
 */
 static void alloc_free_block(void *bp, size_t words)
 {
-    size_t bp_tot_size = GET_SIZE(bp) + HDR_FTR_SIZE; // 가용 블록의 사이즈 (= 페이로드 + 헤더 + 푸터)
-    size_t needed_tot_size = words + HDR_FTR_SIZE; // 할당 받아야 하는 사이즈
+    size_t bp_tot_size = GET_SIZE(bp) + HDR_FTR_SIZE;                      // 가용 블록의 사이즈 (= 페이로드 + 헤더 + 푸터)
+    size_t needed_size = words;                                            // 할당 받아야 하는 사이즈
+    size_t needed_tot_size = needed_size + HDR_FTR_SIZE;                   // 할당 받아야 하는 사이즈 (헤더, 푸터 포함)
     size_t left_block_size = bp_tot_size - needed_tot_size - HDR_FTR_SIZE; // 할당하고 남는 블록의 사이즈
 
-    char **new_block;
+    char **new_block_ptr; // 할당하고 남는 새로운 가용 블록의 포인터
 
-    if ()
+    if ((int)left_block_size > 0) // 할당하고도 블록이 남는 경우
+    {
+        // 필요한 사이즈만큼 메모리 할당
+        PUT_WORD(bp, PACK(needed_size, TAKEN));
+        PUT_WORD(FTRP(bp), PACK(needed_size, TAKEN));
 
+        // 새로운 가용 블록의 포인터
+        new_block_ptr = (char **)(bp) + needed_tot_size;
+
+        // 새로운 가용 블록의 헤더, 푸터 정보 셋팅
+        PUT_WORD(new_block_ptr, PACK(left_block_size, FREE));
+        PUT_WORD(FTRP(new_block_ptr), PACK(left_block_size, FREE));
+
+        // 인접한 가용 블록이 있는 경우 연결
+        new_block_ptr = coalesce(new_block_ptr);
+
+        // 가용 리스트에 추가
+        place_block_into_free_list(new_block_ptr);
+    }
+    else if (left_block_size == 0) // 필요한 만큼 할당하고 남는 블록이 2워드이면 쪼갤 수 없으므로 2워드를 추가하여 메모리를 할당함
+    {
+        PUT_WORD(bp, PACK(needed_tot_size, TAKEN));
+        PUT_WORD(FTRP(bp), PACK(needed_tot_size, TAKEN));
+    }
+    else // 할당하려는 블록의 사이즈와 동일한 경우
+    {
+        PUT_WORD(bp, PACK(needed_size, TAKEN));
+        PUT_WORD(FTRP(bp), PACK(needed_size, TAKEN));
+    }
+}
+
+/* remove_block_from_free_list: 가용 리스트에서 블록 제거하기 */
+static void remove_block_from_free_list(char **bp)
+{
+    char **prev_block = GET_PRED(bp);
+    char **next_block = GET_SUCC(bp);
+    int index;
+
+    if (GET_SIZE(bp) == 0)
+        return;
+    
+    if (prev_block == NULL) // 해당 size class 리스트의 맨 앞에 있는 가장 큰 블록인 경우
+    {
+        index = find_free_list_index(GET_SIZE(bp)); // 블록이 포함된 가용 리스트의 인덱스
+        GET_FREE_LIST_PTR(index) = next_block; // 다음 블록을 가용 리스트의 첫 번째 블록으로 설정
+        
+    }
 }
