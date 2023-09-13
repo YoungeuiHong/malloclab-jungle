@@ -111,12 +111,14 @@ team_t team = {
 
 static char **free_lists;
 static char **heap_ptr;
+static int previous_size;
 
 /************************************** 함수 선언부 *******************************************/
 
 static void *extend_heap(size_t words);
 static void place_block_into_free_list(char **bp);
 static int round_up_power_2(int x);
+static int round_to_thousand(size_t x);
 static size_t find_free_list_index(size_t words);
 static void *find_free_block(size_t words);
 static void alloc_free_block(void *bp, size_t words);
@@ -219,55 +221,16 @@ void mm_free(void *ptr)
 }
 
 /* mm_realloc: 메모리 재할당하기 */
-// void *mm_realloc(void *bp, size_t size)
-// {
-//     void *old_bp = bp;
-//     void *new_bp = bp;
-//     size_t copy_size;
-
-//     // size가 0인 경우 메모리 반환만 수행
-//     if (size <= 0)
-//     {
-//         mm_free(bp);
-//         return 0;
-//     }
-
-//     // 새로운 메모리 블록 할당하기
-//     new_bp = mm_malloc(size);
-//     if (new_bp == NULL)
-//         return NULL;
-
-//     // 기존 데이터 복사
-//     copy_size = GET_SIZE(bp);
-//     if (size < copy_size)
-//         copy_size = size;
-//     memcpy(new_bp, old_bp, copy_size);
-
-//     // 이전 메모리 블록 해제
-//     mm_free(old_bp);
-
-//     return new_bp;
-// }
-
-int round_to_thousand(size_t x)
-{
-    return x % 1000 >= 500 ? x + 1000 - x % 1000 : x - x % 1000;
-}
-
-// Calculate the diff between previous request size and current request
-// Determine the buffer size of the newly reallocated block based on this diff
-// Call mm_realloc_wrapped to perform the actual reallocation
 void *mm_realloc(void *ptr, size_t size)
 {
-    static int previous_size;
     int buffer_size;
     int diff = abs(size - previous_size);
 
-    if (diff < 1 << 12 && diff % round_up_power_2(diff))
+    if (diff < CHUNK * WORD_SIZE && diff % round_up_power_2(diff)) // diff가 4KB보다 작은 경우
     {
         buffer_size = round_up_power_2(diff);
     }
-    else
+    else // diff 사이즈가 4KB보다 큰 경우
     {
         buffer_size = round_to_thousand(size);
     }
@@ -275,44 +238,34 @@ void *mm_realloc(void *ptr, size_t size)
     void *return_value = mm_realloc_wrapped(ptr, size, buffer_size);
 
     previous_size = size;
+
     return return_value;
 }
 
-// Realloc a block
 /*
-    mm_realloc:
-    if the pointer given is NULL, behaves as malloc would
-    if the size given is zero, behaves as free would
-
-    As an optamizing, checks if it is possible to use neighboring blocks
-    and coalesce so as to avoid allocating new blocks.
-
-    If that is not possible, simple reallocates based on alloc and free.
-
-    Uses buffer to not have to reallocate often.
+mm_realloc_wrapped: mm_realloc의 helper function
+- ptr이 NULL인 경우 mm_malloc 수행
+- size가 0인 경우 메모리 해제 수행
+- 최적화를 위해 인접한 블록을 사용할 수 있는지 확인하고 연결하여 새로운 블록을 할당하는 것을 방지함
+- 사용 가능한 인접 블록이 없는 경우 단순히 할당하고 해제함
+- 너무 자주 재할당하지 않도록 buffer 사용
 */
 void *mm_realloc_wrapped(void *ptr, size_t size, int buffer_size)
 {
-
-    // equivalent to mm_malloc if ptr is NULL
     if (ptr == NULL)
-    {
-        return mm_malloc(ptr);
-    }
+        return mm_malloc(ptr); // ptr이 NULL인 경우 mm_malloc 수행
 
-    // adjust to be at start of block
+    // 블록의 시작 지점을 가리키도록 조정
     char **old = (char **)ptr - 1;
     char **bp = (char **)ptr - 1;
 
-    // get intended and current size
-    size_t new_size = ALIGN(size) / WORD_SIZE; // in words
+    size_t new_size = ALIGN(size) / WORD_SIZE;
     size_t size_with_buffer = new_size + buffer_size;
-    size_t old_size = GET_SIZE(bp); // in words
+    size_t old_size = GET_SIZE(bp);
 
+    // 재할당하려는 사이즈가 기존 사이즈보다 작은 경우
     if (size_with_buffer == old_size && new_size <= size_with_buffer)
-    {
         return bp + HDR_SIZE;
-    }
 
     if (new_size == 0)
     {
@@ -321,49 +274,39 @@ void *mm_realloc_wrapped(void *ptr, size_t size, int buffer_size)
     }
     else if (new_size > old_size)
     {
-        if (GET_SIZE(NEXT_BLOCK_IN_HEAP(bp)) + old_size + 2 >= size_with_buffer &&
-            GET_STATUS(PREV_BLOCK_IN_HEAP(bp)) == TAKEN &&
-            GET_STATUS(NEXT_BLOCK_IN_HEAP(bp)) == FREE)
-        { // checks if possible to merge with previous block in memory
+        size_t prev_block_size = GET_SIZE(PREV_BLOCK_IN_HEAP(bp));
+        size_t next_block_size = GET_SIZE(NEXT_BLOCK_IN_HEAP(bp));
+        int prev_status = GET_STATUS(PREV_BLOCK_IN_HEAP(bp));
+        int next_status = GET_STATUS(NEXT_BLOCK_IN_HEAP(bp));
+
+        if (next_block_size + old_size + 2 >= size_with_buffer && prev_status == TAKEN && next_status == FREE) // 뒤의 블록이 가용 블록인 경우
+        {
             PUT_WORD(bp, PACK(old_size, FREE));
             PUT_WORD(FTRP(bp), PACK(old_size, FREE));
-
             bp = coalesce(bp);
             alloc_free_block(bp, size_with_buffer);
         }
-        else if (GET_SIZE(PREV_BLOCK_IN_HEAP(bp)) + old_size + 2 >= size_with_buffer &&
-                 GET_STATUS(PREV_BLOCK_IN_HEAP(bp)) == FREE &&
-                 GET_STATUS(NEXT_BLOCK_IN_HEAP(bp)) == TAKEN)
-        { // checks if possible to merge with next block in memory
+        else if (prev_block_size + old_size + 2 >= size_with_buffer && prev_status == FREE && next_status == TAKEN) // 앞의 블록이 가용 블록인 경우
+        {
             PUT_WORD(bp, PACK(old_size, FREE));
             PUT_WORD(FTRP(bp), PACK(old_size, FREE));
-
             bp = coalesce(bp);
-
             memmove(bp + 1, old + 1, old_size * WORD_SIZE);
             alloc_free_block(bp, size_with_buffer);
         }
-        else if (GET_SIZE(PREV_BLOCK_IN_HEAP(bp)) + GET_SIZE(NEXT_BLOCK_IN_HEAP(bp)) + old_size + 4 >= size_with_buffer &&
-                 GET_STATUS(PREV_BLOCK_IN_HEAP(bp)) == FREE &&
-                 GET_STATUS(NEXT_BLOCK_IN_HEAP(bp)) == FREE)
-        { // checks if possible to merge with both prev and next block in memory
+        else if (prev_block_size + next_block_size + old_size + 4 >= size_with_buffer && prev_status == FREE && next_status == FREE) // 앞뒤 블록이 모두 가용 블록인 경우
+        {
             PUT_WORD(bp, PACK(old_size, FREE));
             PUT_WORD(FTRP(bp), PACK(old_size, FREE));
-
             bp = coalesce(bp);
-
             memmove(bp + 1, old + 1, old_size * WORD_SIZE);
             alloc_free_block(bp, size_with_buffer);
         }
         else
-        { // end case: if no optimization possible, just do brute force realloc
+        {
             bp = (char **)mm_malloc(size_with_buffer * WORD_SIZE + WORD_SIZE) - 1;
-
             if (bp == NULL)
-            {
                 return NULL;
-            }
-
             memcpy(bp + 1, old + 1, old_size * WORD_SIZE);
             mm_free(old + 1);
         }
@@ -469,6 +412,12 @@ static int round_up_power_2(int x)
     x |= x >> 8;
     x |= x >> 16;
     return x + 1;
+}
+
+/* 가장 가까운 1000의 단위의 수를 찾는 함수 */
+static int round_to_thousand(size_t x)
+{
+    return x % 1000 >= 500 ? x + 1000 - x % 1000 : x - x % 1000;
 }
 
 /* find_free_list_index: 주어진 words 사이즈가 속하는 size class, 즉 가용 리스트 상의 인덱스를 찾는 함수 */
