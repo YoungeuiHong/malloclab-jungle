@@ -67,12 +67,18 @@ team_t team = {
 #define GET_STATUS(p) (GET(p) & 0x1)
 
 /*
+ * 블록의 크기와 할당 비트를 통합해서 header와 footer에 저장할 수 있는 값 만들기
+ * Pack a size and allocated bit into a word
+ */
+#define PACK(size, alloc) ((size) | (alloc))
+
+/*
  * 블록 헤더의 주소 가져오기
  */
 #define HDRP(bp) ((char *)(bp)-WSIZE)
 
 /* 블록 푸터의 주소 가져오기 */
-#define FTRP(bp) ((char *)(bp) + GET_SIZE(HDRP(bp)) - DSIZE)
+#define FTRP(header_p) ((char **)(header_p) + GET_SIZE(header_p) + HDR_SIZE)
 
 /* 헤더와 푸터를 포함한 블록의 사이즈 가져오기 */
 #define GET_TOTAL_SIZE(p) (GET_SIZE(p) + HDR_FTR_SIZE)
@@ -111,12 +117,12 @@ static char **heap_ptr;
 
 /************************************** 함수 선언부 *******************************************/
 
-static size_t find_free_list_index(size_t words);
 static void *extend_heap(size_t words);
+static void place_block_into_free_list(char **bp);
+static size_t find_free_list_index(size_t words);
 static void *coalesce(void *bp);
 static void *find_free_block(size_t words);
 static void alloc_free_block(void *bp, size_t words);
-static void place_block_into_free_list(char **bp);
 static void remove_block_from_free_list(char **bp);
 static int round_up_power_2(int x);
 void *mm_realloc_wrapped(void *ptr, size_t size, int buffer_size);
@@ -136,10 +142,10 @@ static int round_up_power_2(int x)
     return x + 1;
 }
 
-/* mm_init - malloc 패키지 초기화하기 */
+/* mm_init: malloc 패키지 초기화하기 */
 int mm_init(void)
 {
-    // MAX POWER만큼 segregated free list의 메모리 할당 받기
+    // segregated free list를 위해 MAX_POWER * sizeof(char *) 만큼 힙 영역 확장하기
     if ((long)(free_lists = mem_sbrk(MAX_POWER * sizeof(char *))) == -1)
         return -1;
 
@@ -149,6 +155,175 @@ int mm_init(void)
         SET_FREE_LIST_PTR(i, NULL);
     }
 
-    // 
+    // 더블 워드 정렬 조건 충족을 위해 워드 사이즈만큼 힙 영역 확장
     mem_sbrk(WORD_SIZE);
+
+    // 프롤로그 블록과 에필로그 블록을 위해 힙 영역 추가 확장
+    if ((long)(heap_ptr = mem_sbrk(4 * WORD_SIZE)) == -1)
+        return -1;
+
+    PUT_WORD(heap_ptr, PACK(0, TAKEN));       // 프롤로그 헤더
+    PUT_WORD(FTRP(heap_ptr), PACK(0, TAKEN)); // 프롤로그 푸터
+
+    char **epilog = NEXT_BLOCK_IN_HEAP(heap_ptr); // 에필로그 헤더 포인터
+    PUT_WORD(epilog, PACK(0, TAKEN));             // 에필로그 헤더
+    PUT_WORD(FTRP(epilog), PACK(0, TAKEN));       // 에필로그 푸터
+
+    heap_ptr = NEXT_BLOCK_IN_HEAP(heap_ptr); // heap 포인터를 프롤로그 블록 다음으로 이동시킴
+
+    // CHUNK 사이즈만큼 힙 영역을 확장하기
+    char **new_block;
+    if ((new_block = extend_heap(CHUNK)) == NULL)
+        return -1;
+
+    // 힙 영역을 확장하여 새로 얻은 블록을 가용 리스트에 추가해주기
+    place_block_into_free_list(new_block);
+
+    return 0;
+}
+
+/* mm_malloc: 메모리 할당하기 */
+void *mm_malloc(size_t size)
+{
+    if (size == 0) return NULL;
+
+    // CHUNK 사이즈보다 작으면 가장 가까운 2의 제곱 사이즈로 만들기
+    if (size <= CHUNK * WORD_SIZE)
+        size = round_up_power_2(size);
+
+    // 바이트 단위 사이즈를 워드 단위 사이즈로 변환하기
+    size_t words = ALIGN(size) / WORD_SIZE;
+
+    size_t extend_size;
+    char **bp;
+
+    // 2) 해당 가용 블록 리스트 내에 가용 블록이 있으면 할당한다.
+
+
+
+    // 3) 가용 블록이 없으면 다음으로 큰 size class의 가용 블록 리스트로 이동하여 탐색한다.
+
+    // 4) 모든 가용 블록 리스트를 탐색했는데도 가용 볼록이 없으면 힙 영역을 확장한다.
+}
+
+/* mm_free: 메모리 반환하기 */
+void mm_free(void *ptr)
+{
+    ptr -= WORD_SIZE; // 헤더 포인터
+
+    // 헤더와 푸터의 할당 상태 정보를 free 상태로 수정
+    size_t size = GET_SIZE(ptr);
+    PUT_WORD(ptr, PACK(size, FREE));
+    PUT_WORD(FTRP(ptr), PACK(size, FREE));
+
+    // 해제된 블록의 전후로 가용 블록이 있다면 연결
+    ptr = coalesce(ptr);
+
+    // 연결된 블록을 가용 리스트에 추가
+    place_block_into_free_list(ptr);
+}
+
+/*
+extend_heap: 힙 영역 확장하기
+- 힙 영역 확장에 성공하는 경우 새로운 블록의 헤더와 푸터 영역을 정의하고, 해당 블록의 포인터를 반환
+- 힙 영역 확장에 실패하는 경우 NULL을 리턴
+*/
+static void *extend_heap(size_t words)
+{
+    char **bp;                                               // 힙 영역을 확장하여 새로 생긴 가용 블록을 가리키는 포인터
+    char **end_pointer;                                      // 가용 블록의 끝을 가리키는 포인터
+    size_t words_extend = EVENIZE(words);                    // 더블 워드 정렬
+    size_t words_extend_total = words_extend + HDR_FTR_SIZE; // 헤더와 푸터 사이즈를 더한 총 블록 사이즈
+
+    if ((long)(bp = mem_sbrk((words_extend_total)*WORD_SIZE)) == -1)
+        return NULL;
+
+    // 새로운 가용 블록의 헤더와 푸터에 값 셋팅
+    PUT_WORD(bp, PACK(words_extend, FREE));
+    PUT_WORD(FTRP(bp), PACK(words_extend, FREE));
+
+    // 힙 영역 마지막에 에필로그 블록 추가
+    bp -= EPILOG_SIZE;
+    end_pointer = bp + words_extend_total;
+    PUT_WORD(end_pointer, PACK(0, TAKEN));
+    PUT_WORD(FTRP(end_pointer), PACK(0, TAKEN));
+
+    return bp;
+}
+
+/* 블록 사이즈에 따라 적절한 위치에 새로운 가용 블록 추가하기 */
+static void place_block_into_free_list(char **bp)
+{
+    size_t size = GET_SIZE(bp); // 새로 배치할 가용 블록의 사이즈
+
+    if (size == 0)
+        return;
+
+    // 가용 블록에 적합한 size class의 가용 리스트 찾기
+    int index = find_free_list_index(size);
+    char **front_ptr = GET_FREE_LIST_PTR(index); // 해당 가용 리스트의 주소를 받아오기
+    char **prev_ptr = NULL;
+
+    // 만약 그 size class의 가용 리스트가 비어있다면
+    if (front_ptr == NULL)
+    {
+        SET_PTR(GET_PTR_PRED_FIELD(bp), NULL);
+        SET_PTR(GET_PTR_PRED_FIELD(bp), NULL);
+        SET_FREE_LIST_PTR(index, bp); // 가용 리스트의 시작 지점으로 설정
+        return;
+    }
+
+    // 만약 새로운 블록이 이 size class의 가용 리스트 내에서 가장 큰 사이즈라면 (가용 리스트는 내림차순으로 정렬되어 있음)
+    if (size >= GET_SIZE(front_ptr))
+    {
+        SET_FREE_LIST_PTR(index, bp); // 가용 리스트의 시작 지점으로 설정
+        SET_PTR(GET_PTR_PRED_FIELD(bp), NULL);
+        SET_PTR(GET_PTR_SUCC_FIELD(bp), front_ptr);
+        SET_PTR(GET_PTR_PRED_FIELD(front_ptr), bp);
+        return;
+    }
+
+    // 내림차순으로 정렬된 가용 리스트에서 블록이 들어갈 지점 찾기
+    while (front_ptr != NULL && GET_SIZE(front_ptr) > size)
+    {
+        prev_ptr = front_ptr;
+        front_ptr = GET_SUCC(front_ptr);
+    }
+
+    if (front_ptr == NULL) // 가용 리스트의 끝에 도달한 경우
+    {
+        SET_PTR(GET_PTR_SUCC_FIELD(prev_ptr), bp);
+        SET_PTR(GET_PTR_PRED_FIELD(bp), prev_ptr);
+        SET_PTR(GET_PTR_SUCC_FIELD(bp), NULL);
+        return;
+    }
+    else { // 가용 리스트의 중간에 집어넣는 경우
+        SET_PTR(GET_PTR_SUCC_FIELD(prev_ptr), bp);
+        SET_PTR(GET_PTR_PRED_FIELD(bp), prev_ptr);
+        SET_PTR(GET_PTR_SUCC_FIELD(bp), front_ptr);
+        SET_PTR(GET_PTR_PRED_FIELD(front_ptr), bp);
+        return;
+    }   
+}
+
+/* 주어진 words 사이즈가 속하는 size class, 즉 가용 리스트 상의 인덱스를 찾는 함수 */
+static size_t find_free_list_index(size_t words)
+{
+    int index = 0;
+
+    while ((index <= MAX_POWER) && (words > 1))
+    {
+        words >>= 1; // words가 1보다 작거나 같아질 때까지 오른쪽으로 shift 연산
+        index++;
+    }
+
+    return index;
+}
+
+static void *find_free_block(size_t words)
+{
+    char **bp;
+    size_t index = find_free_list_index(words); // 주어진 words 사이즈에 
+
+
 }
